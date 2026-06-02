@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: 'Skip the 24 h commit check and always deploy'
+        description: 'Force full rebuild and upload (ignores last-SHA)'
         type: boolean
         default: false
 
-# Never run two syncs in parallel; do not cancel an in-progress deploy.
+# Never run two syncs in parallel; do not cancel a deploy already in flight.
 concurrency:
   group: sync
   cancel-in-progress: false
@@ -33,19 +33,16 @@ jobs:
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           SINCE=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')
           count=$(curl -sf \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/typst/packages/commits?since=${SINCE}&per_page=1" \
             | jq 'length')
-
           if [ "${count}" -gt 0 ]; then
-            echo "New commits found since ${SINCE}, proceeding with deploy."
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No new commits since ${SINCE}, skipping deploy."
+            echo "No new commits in the last 24 h, skipping."
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -58,70 +55,202 @@ jobs:
     permissions:
       contents: read
     steps:
+
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           repository: typst/packages
           # Full history is required so the bundler can derive package timestamps.
           fetch-depth: 0
 
+      - name: Get upstream HEAD SHA
+        id: upstream
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The last successfully deployed SHA is persisted as a small file in Bunny.
+      # It is the baseline for the git diff that finds new package versions.
+      - name: Fetch last deployed SHA from Bunny
+        id: last
+        env:
+          BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
+          BUNNY_STORAGE_API_KEY: ${{ secrets.BUNNY_STORAGE_API_KEY }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "${FORCE}" = "true" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sha=$(curl -sf \
+            -H "AccessKey: ${BUNNY_STORAGE_API_KEY}" \
+            "${BUNNY_STORAGE_ENDPOINT%/}/.meta/last-sha" || echo "")
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      # mode=full    — first run, no prior SHA, or forced
+      # mode=partial — new package version dirs found via git diff
+      # mode=skip    — upstream had commits but no package-version dirs changed
+      - name: Determine build mode
+        id: mode
+        env:
+          LAST_SHA: ${{ steps.last.outputs.sha }}
+        run: |
+          if [ -z "${LAST_SHA}" ]; then
+            echo "value=full" >> "$GITHUB_OUTPUT"
+            echo "Full build: no prior deployed SHA recorded."
+            exit 0
+          fi
+
+          new_pkgs=$(git diff --name-only "${LAST_SHA}..HEAD" -- packages/ \
+            | grep -oE 'packages/[^/]+/[^/]+/[^/]+' | sort -u)
+
+          if [ -z "$new_pkgs" ]; then
+            echo "value=skip" >> "$GITHUB_OUTPUT"
+            echo "No new package versions; nothing to build or upload."
+          else
+            echo "$new_pkgs" > /tmp/new-pkgs.txt
+            echo "value=partial" >> "$GITHUB_OUTPUT"
+            echo "Partial build. New package versions:"
+            cat /tmp/new-pkgs.txt
+          fi
+
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable channel
+        if: steps.mode.outputs.value != 'skip'
+
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        if: steps.mode.outputs.value != 'skip'
         with:
           workspaces: bundler
 
       - name: Build bundler
+        if: steps.mode.outputs.value != 'skip'
         run: cargo build --release --manifest-path bundler/Cargo.toml
 
-      - name: Package
+      - name: Package (full)
+        if: steps.mode.outputs.value == 'full'
         run: bundler/target/release/bundler
 
-      - name: Delete old Bunny Storage files
+      # Incremental build: create a git worktree containing only the new package
+      # version dirs. The worktree shares the object database with the main
+      # checkout, so "git log --follow" (used by the bundler for timestamps)
+      # still resolves correctly against the full history.
+      - name: Package (incremental)
+        if: steps.mode.outputs.value == 'partial'
+        run: |
+          git worktree add /tmp/partial-ws HEAD
+
+          # Remove every existing package version — keep only the new ones.
+          find /tmp/partial-ws/packages -mindepth 3 -maxdepth 3 -type d \
+          | while read -r dir; do
+            rel="${dir#/tmp/partial-ws/}"
+            grep -qxF "$rel" /tmp/new-pkgs.txt || rm -rf "$dir"
+          done
+
+          # Drop empty name dirs, then empty namespace dirs.
+          find /tmp/partial-ws/packages -mindepth 2 -maxdepth 2 -type d -empty -delete
+          find /tmp/partial-ws/packages -mindepth 1 -maxdepth 1 -type d -empty -delete
+
+          cd /tmp/partial-ws
+          "${GITHUB_WORKSPACE}/bundler/target/release/bundler" \
+            --out-dir "${GITHUB_WORKSPACE}/dist"
+
+      # Download the current Bunny indexes and merge in the entries produced by
+      # the partial build. releasedAt in index.extra.json must equal the minimum
+      # updatedAt across all versions of a package, so we recompute it after
+      # combining the old and new arrays.
+      - name: Merge indexes
+        if: steps.mode.outputs.value == 'partial'
         env:
           BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
           BUNNY_STORAGE_API_KEY: ${{ secrets.BUNNY_STORAGE_API_KEY }}
         run: |
           BASE="${BUNNY_STORAGE_ENDPOINT%/}"
 
-          http_code=$(curl --silent --show-error --globoff \
-            --output /tmp/bunny-list.json \
-            --write-out "%{http_code}" \
-            -H "AccessKey: ${BUNNY_STORAGE_API_KEY}" \
-            -H "Accept: application/json" \
-            "${BASE}/")
+          curl -sf -H "AccessKey: ${BUNNY_STORAGE_API_KEY}" \
+            "${BASE}/preview/index.json" > /tmp/existing-index.json \
+            || echo "[]" > /tmp/existing-index.json
 
-          echo "List response: HTTP ${http_code}"
-          echo "Contents:" && cat /tmp/bunny-list.json | jq .
-          if [ "${http_code}" != "200" ]; then
-            exit 1
-          fi
+          jq -s '
+            (.[0] + .[1])
+            | group_by([.name, .version]) | map(last)
+            | sort_by([.name, (.version | split(".") | map(tonumber? // 0))])
+          ' /tmp/existing-index.json dist/preview/index.json \
+            > /tmp/merged-index.json \
+            && mv /tmp/merged-index.json dist/preview/index.json
 
-          # Bunny needs a trailing slash to delete directories recursively.
-          jq -c '.[]' /tmp/bunny-list.json | while read -r item; do
-            name=$(echo "$item" | jq -r '.ObjectName')
-            is_dir=$(echo "$item" | jq -r '.IsDirectory')
-            if [ "$is_dir" = "true" ]; then path="${name}/"; else path="${name}"; fi
-            echo "Deleting (dir=${is_dir}): ${BASE}/${path}"
-            curl --fail --show-error --globoff \
-              -X DELETE "${BASE}/${path}" \
-              -H "AccessKey: ${BUNNY_STORAGE_API_KEY}"
-          done
+          curl -sf -H "AccessKey: ${BUNNY_STORAGE_API_KEY}" \
+            "${BASE}/preview/index.extra.json" > /tmp/existing-index.extra.json \
+            || echo "[]" > /tmp/existing-index.extra.json
 
-      - name: Upload to Bunny Storage
+          jq -s '
+            (.[0] + .[1])
+            | group_by([.name, .version]) | map(last)
+            | group_by(.name) | map(
+                . as $grp |
+                ($grp | map(.releasedAt // .updatedAt) | min) as $min |
+                $grp | map(.releasedAt = $min)
+              )
+            | flatten
+            | sort_by([.name, (.version | split(".") | map(tonumber? // 0))])
+          ' /tmp/existing-index.extra.json dist/preview/index.extra.json \
+            > /tmp/merged-index.extra.json \
+            && mv /tmp/merged-index.extra.json dist/preview/index.extra.json
+
+      - name: Upload all files (full build)
+        if: steps.mode.outputs.value == 'full'
         env:
           BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
           BUNNY_STORAGE_API_KEY: ${{ secrets.BUNNY_STORAGE_API_KEY }}
         run: |
           BASE="${BUNNY_STORAGE_ENDPOINT%/}"
           find dist -type f | while read -r file; do
-            remote_path="${file#dist/}"
+            remote="${file#dist/}"
             curl --fail --silent --show-error --globoff \
-              -X PUT "${BASE}/${remote_path}" \
+              -X PUT "${BASE}/${remote}" \
               -H "AccessKey: ${BUNNY_STORAGE_API_KEY}" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${file}"
           done
 
+      # Upload only the artifacts for new package versions plus the updated index
+      # files. All other immutable files (.tar.gz, thumbnails) already exist in
+      # Bunny and are left untouched.
+      - name: Upload new artifacts (incremental)
+        if: steps.mode.outputs.value == 'partial'
+        env:
+          BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
+          BUNNY_STORAGE_API_KEY: ${{ secrets.BUNNY_STORAGE_API_KEY }}
+        run: |
+          BASE="${BUNNY_STORAGE_ENDPOINT%/}"
+
+          upload() {
+            local file="$1" remote="${1#dist/}"
+            curl --fail --silent --show-error --globoff \
+              -X PUT "${BASE}/${remote}" \
+              -H "AccessKey: ${BUNNY_STORAGE_API_KEY}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}"
+            echo "  ↑ ${remote}"
+          }
+
+          while IFS= read -r pkg; do
+            ns=$(echo "$pkg"   | cut -d/ -f2)
+            name=$(echo "$pkg" | cut -d/ -f3)
+            ver=$(echo "$pkg"  | cut -d/ -f4)
+
+            for f in \
+              "dist/${ns}/${name}-${ver}.tar.gz" \
+              "dist/${ns}/thumbnails/${name}-${ver}.webp" \
+              "dist/${ns}/thumbnails/${name}-${ver}-small.webp" \
+              "dist/${ns}/readmes/${name}-${ver}.md"
+            do
+              [ -f "$f" ] && upload "$f"
+            done
+          done < /tmp/new-pkgs.txt
+
+          # Both index files cover all packages and always need to be replaced.
+          upload dist/preview/index.json
+          upload dist/preview/index.extra.json
+
       - name: Purge Bunny Pull Zone cache
+        if: steps.mode.outputs.value != 'skip'
         env:
           BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
           BUNNY_PULL_ZONE_ID: ${{ secrets.BUNNY_PULL_ZONE_ID }}
@@ -129,3 +258,17 @@ jobs:
           curl --fail --silent --show-error \
             -X POST "https://api.bunny.net/pullzone/${BUNNY_PULL_ZONE_ID}/purgeCache" \
             -H "AccessKey: ${BUNNY_API_KEY}"
+
+      # Persist the current upstream SHA so the next run knows the diff baseline.
+      - name: Record deployed SHA in Bunny
+        if: steps.mode.outputs.value != 'skip'
+        env:
+          BUNNY_STORAGE_ENDPOINT: ${{ secrets.BUNNY_STORAGE_ENDPOINT }}
+          BUNNY_STORAGE_API_KEY: ${{ secrets.BUNNY_STORAGE_API_KEY }}
+        run: |
+          echo -n "${{ steps.upstream.outputs.sha }}" \
+          | curl --fail --silent --show-error \
+            -X PUT "${BUNNY_STORAGE_ENDPOINT%/}/.meta/last-sha" \
+            -H "AccessKey: ${BUNNY_STORAGE_API_KEY}" \
+            -H "Content-Type: text/plain" \
+            --data-binary @-
